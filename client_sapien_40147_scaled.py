@@ -1,4 +1,5 @@
 import time
+import os
 import numpy as np
 import zmq
 import zlib
@@ -10,6 +11,8 @@ import fpsample
 
 import sapien
 import sapien.render
+
+from rgbd_dumper import RGBDDumper
 
 # -----------------
 # 数学工具
@@ -251,7 +254,6 @@ def main():
     loader.scale = 0.6
 
     # 加载柜子（40147, 缩 0.6 + 重摆基座以进入 Panda 可达域）
-    import os
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cabinet_urdf = os.path.join(base_dir, "40147", "mobility.urdf")
     cabinet = loader.load(cabinet_urdf)
@@ -315,6 +317,9 @@ def main():
     cam = scene.add_camera('rgbd_camera', 640, 480, np.deg2rad(60), 0.01, 10.0)
     cam_eye, cam_target = np.array([-0.4, -1.0, 1.0]), np.array([0.8, 0.0, 0.5])
     cam.entity.set_pose(sapien_look_at(cam_eye, cam_target))
+
+    rgbd_dumper = RGBDDumper(run_tag_hint="40147")
+    rgbd_dumper.write_meta_once(cam, cabinet_id="40147")
 
     viewer = None
     try:
@@ -426,6 +431,10 @@ def main():
                 cur_ap = get_agent_pos(hand_link, panda)
                 cur_rgb, cur_depth = get_raw_rgb_depth_from_buffers(pos_buf, col_buf)
                 cam_pos, cam_mat, fovy = get_camera_params(cam)
+
+                if rgbd_dumper.should_dump(step_idx):
+                    rgbd_dumper.dump(step_idx, cur_rgb, cur_depth,
+                                     RGBDDumper.c2w_from_camera(cam), cam_pos)
                 
                 obs_history['pc'].append(cur_pc); obs_history['gp'].append(cur_gp); obs_history['ap'].append(cur_ap)
                 if len(obs_history['pc']) > 2:
@@ -454,6 +463,10 @@ def main():
 
     except KeyboardInterrupt: print("\n用户中断。")
     finally:
+        try:
+            rgbd_dumper.dump_final(step_idx, scene, cam)
+        except Exception as e:
+            print(f"[RGBDDumper] final dump skipped: {e}")
         comm_thread.running = False
         if viewer is not None:
             try: viewer.close()

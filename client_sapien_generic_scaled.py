@@ -11,6 +11,8 @@ import fpsample
 import sapien
 import sapien.render
 
+from rgbd_dumper import RGBDDumper
+
 # -----------------
 # 数学工具
 # -----------------
@@ -330,6 +332,21 @@ def main():
     print(f"[generic] camera eye={cam_eye.tolist()} target={cam_target.tolist()}", flush=True)
     cam.entity.set_pose(sapien_look_at(cam_eye, cam_target))
 
+    # SAM3D streaming dump (env-driven; no-op if SAM3D_DUMP_DIR unset)
+    # cabinet_id derived from URDF parent dir name (e.g. ".../45132/mobility.urdf" -> "45132")
+    _cabinet_id = os.path.basename(os.path.dirname(os.path.abspath(cabinet_urdf)))
+    rgbd_dumper = RGBDDumper(run_tag_hint=_cabinet_id)
+    rgbd_dumper.write_meta_once(cam, cabinet_id=_cabinet_id)
+
+    # Frame dump for mp4 post-processing
+    _FRAME_DIR = os.environ.get("FRAME_DUMP_DIR")
+    _FRAME_EVERY = int(os.environ.get("FRAME_EVERY", "3"))  # save every Nth obs cycle
+    if _FRAME_DIR:
+        os.makedirs(_FRAME_DIR, exist_ok=True)
+        print(f"[generic] frame dump -> {_FRAME_DIR} (every {_FRAME_EVERY} obs)", flush=True)
+    _frame_counter = [0]  # mutable holder for nested scope
+    _frame_idx = [0]
+
     viewer = None
     try:
         from sapien.utils import Viewer
@@ -436,13 +453,26 @@ def main():
             if comm_thread.obs_queue.empty():
                 scene.update_render()
                 pos_buf, seg_buf, col_buf = take_picture_once(cam)
-                
+
                 cur_pc = get_point_cloud_from_buffers(pos_buf, seg_buf, cam, cabinet_seg_ids)
                 cur_gp = get_gripper_pcd(hand_link, lf_link, rf_link)
                 cur_ap = get_agent_pos(hand_link, panda)
                 cur_rgb, cur_depth = get_raw_rgb_depth_from_buffers(pos_buf, col_buf)
+
+                # Frame dump for post-hoc mp4 generation
+                if _FRAME_DIR:
+                    _frame_counter[0] += 1
+                    if _frame_counter[0] % _FRAME_EVERY == 0:
+                        import cv2 as _cv2
+                        frame_path = os.path.join(_FRAME_DIR, f"f_{_frame_idx[0]:06d}.jpg")
+                        _cv2.imwrite(frame_path, _cv2.cvtColor(cur_rgb, _cv2.COLOR_RGB2BGR))
+                        _frame_idx[0] += 1
                 cam_pos, cam_mat, fovy = get_camera_params(cam)
-                
+
+                if rgbd_dumper.should_dump(step_idx):
+                    rgbd_dumper.dump(step_idx, cur_rgb, cur_depth,
+                                     RGBDDumper.c2w_from_camera(cam), cam_pos)
+
                 obs_history['pc'].append(cur_pc); obs_history['gp'].append(cur_gp); obs_history['ap'].append(cur_ap)
                 if len(obs_history['pc']) > 2:
                     for k in obs_history: obs_history[k].pop(0)
@@ -471,6 +501,10 @@ def main():
 
     except KeyboardInterrupt: print("\n用户中断。")
     finally:
+        try:
+            rgbd_dumper.dump_final(step_idx, scene, cam)
+        except Exception as e:
+            print(f"[RGBDDumper] final dump skipped: {e}")
         comm_thread.running = False
         if viewer is not None:
             try: viewer.close()
