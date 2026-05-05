@@ -60,7 +60,7 @@ from loftr_pf import LoFTRAxisEstimator
 
 # ─────────────────────────── Configuration ────────────────────────────────────
 
-ZMQ_PORT         = 5555
+ZMQ_PORT         = int(os.environ.get("VLM_ZMQ_PORT", "5555"))
 DET_SERVER_URL   = "http://127.0.0.1:8000/detect"
 DET_QUERIES      = ["handle", "drawer", "cabinet door"]
 

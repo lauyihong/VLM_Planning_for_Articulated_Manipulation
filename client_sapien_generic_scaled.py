@@ -1,3 +1,5 @@
+import json
+import os
 import time
 import numpy as np
 import zmq
@@ -237,7 +239,8 @@ class ZMQCommunicationThread(threading.Thread):
 # -----------------
 def main():
     # 初始化通讯线程
-    comm_thread = ZMQCommunicationThread("tcp://localhost:5555")
+    comm_thread = ZMQCommunicationThread(
+        f"tcp://localhost:{os.environ.get('VLM_ZMQ_PORT', '5555')}")
     comm_thread.start()
 
     # 初始化 SAPIEN 场景
@@ -251,7 +254,6 @@ def main():
     loader = scene.create_urdf_loader()
     loader.fix_root_link = True
     # Configurable via env: CABINET_URDF (absolute path) + CABINET_SCALE + CABINET_Z
-    import os
     base_dir = os.path.dirname(os.path.abspath(__file__))
     _default_urdf = os.path.join(base_dir, "46230", "mobility.urdf")
     cabinet_urdf = os.environ.get("CABINET_URDF", _default_urdf)
@@ -347,15 +349,26 @@ def main():
     _frame_counter = [0]  # mutable holder for nested scope
     _frame_idx = [0]
 
+    # Headless / autostart / wall-clock budget for batch stability tests.
+    # Set CABINET_HEADLESS=1 to skip viewer creation (no GUI window),
+    # CABINET_AUTOSTART=1 to skip the spacebar gate,
+    # CABINET_TIME_BUDGET_S=60 to terminate the loop after N seconds.
+    HEADLESS = bool(int(os.environ.get("CABINET_HEADLESS", "0")))
+    AUTOSTART = bool(int(os.environ.get("CABINET_AUTOSTART", "0")))
+    TIME_BUDGET_S = float(os.environ.get("CABINET_TIME_BUDGET_S", "0"))
+
     viewer = None
-    try:
-        from sapien.utils import Viewer
-        viewer = Viewer()
-        viewer.set_scene(scene)
-        viewer.set_camera_xyz(x=-1.14, y=-0.09, z=1.2)
-        viewer.set_camera_rpy(r=0, p=-0.3, y=0.1)
-        viewer.paused = False
-    except Exception as e: print(f"[WARN] 无法创建 Viewer: {e}")
+    if not HEADLESS:
+        try:
+            from sapien.utils import Viewer
+            viewer = Viewer()
+            viewer.set_scene(scene)
+            viewer.set_camera_xyz(x=-1.14, y=-0.09, z=1.2)
+            viewer.set_camera_rpy(r=0, p=-0.3, y=0.1)
+            viewer.paused = False
+        except Exception as e: print(f"[WARN] 无法创建 Viewer: {e}", flush=True)
+    else:
+        print(f"[generic] HEADLESS=1, no viewer", flush=True)
 
     # 控制与同步参数
     VELOCITY_FACTOR = 0.2
@@ -371,8 +384,8 @@ def main():
     obs_history = {'pc': [], 'gp': [], 'ap': []}
     step_idx = 0
     
-    # 预览模式
-    started = False
+    # 预览模式 (跳过 if AUTOSTART=1)
+    started = AUTOSTART
     while not started:
         if viewer is not None:
             if viewer.closed: return
@@ -381,7 +394,10 @@ def main():
         scene.step()
         time.sleep(0.01)
 
-    print("🚀 异步控制已启动...")
+    if AUTOSTART:
+        print("🚀 AUTOSTART — 直接进入控制循环", flush=True)
+    else:
+        print("🚀 异步控制已启动...", flush=True)
     
     # 时钟对齐
     start_wall_time = time.perf_counter()
@@ -392,6 +408,10 @@ def main():
             if viewer is not None and viewer.closed: break
 
             current_wall_time = time.perf_counter() - start_wall_time
+            if TIME_BUDGET_S > 0 and current_wall_time > TIME_BUDGET_S:
+                print(f"\n[generic] TIME_BUDGET_S={TIME_BUDGET_S}s reached "
+                      f"(steps={step_idx}); exiting loop.", flush=True)
+                break
             
             # --- 1. 检查是否有新 Action 到达 ---
             if not comm_thread.action_queue.empty():
@@ -505,11 +525,31 @@ def main():
             rgbd_dumper.dump_final(step_idx, scene, cam)
         except Exception as e:
             print(f"[RGBDDumper] final dump skipped: {e}")
+        # Dump final cabinet qpos snapshot for batch stability evaluation
+        result_path = os.environ.get("CABINET_RESULT_JSON")
+        if result_path:
+            try:
+                qpos_arr = cabinet.get_qpos()
+                joint_names = [j.name for j in cabinet.get_joints() if j.type != "fixed"]
+                qpos_dict = {n: float(qpos_arr[i]) for i, n in enumerate(joint_names)}
+                result = {
+                    "cabinet_urdf": cabinet_urdf,
+                    "scale": cabinet_scale,
+                    "n_steps": int(step_idx),
+                    "wall_time_s": float(time.perf_counter() - start_wall_time),
+                    "final_qpos": qpos_dict,
+                }
+                os.makedirs(os.path.dirname(result_path), exist_ok=True)
+                with open(result_path, "w") as f:
+                    json.dump(result, f, indent=2)
+                print(f"[generic] result → {result_path}", flush=True)
+            except Exception as e:
+                print(f"[generic] result dump failed: {e}", flush=True)
         comm_thread.running = False
         if viewer is not None:
             try: viewer.close()
             except: pass
-        print("仿真已关闭。")
+        print("仿真已关闭。", flush=True)
 
 if __name__ == "__main__":
     main()
