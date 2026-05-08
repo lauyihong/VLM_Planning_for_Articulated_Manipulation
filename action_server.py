@@ -96,7 +96,11 @@ PULL_ARC_ANGLE   = np.deg2rad(80)  # total door sweep
 ARC_STEP         = np.deg2rad(0.4)  # rad per step
 
 # ProbePull / TypeCheck
-PROBE_DISTANCE       = 0.05   # m — small pull for type identification
+PROBE_DISTANCE       = 0.05   # m — small pull for type identification.
+# DON'T raise above ~0.05 for revolute (cabinet door) joints: the gripper is
+# anchored to the handle, which moves along an arc with limited along-normal
+# travel; longer probe targets are physically unreachable, ProbePull never
+# completes (`pulled >= PROBE_DISTANCE - 0.005` stays false), task hangs.
 TYPECHECK_MARGIN     = 0.002  # m — margin for Translation vs Rotation decision
 EDGE_PERCENTILE      = 10     # % — edge band width for axis fitting
 CHAMFER_TRIM_RATIO   = 0.9    # top 90% nearest-neighbour distances used

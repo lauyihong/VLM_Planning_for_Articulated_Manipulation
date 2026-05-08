@@ -64,10 +64,19 @@ sam3: StreamingSAM3 | None = None
 # Convention: static_parts[0] MUST be the articulation parent (largest body).
 # Names must be SAM3 text-promptable (used directly as text queries).
 PARTS_BY_ID = {
+    # Per PartNet-Mobility semantics.txt:
+    #   40147: link_0 hinge rotation_door, link_1 slider drawer, link_2 body
+    #     ⇒ task fallback plan abuses target_handle_id=1 = hinge door (Pull_Arc)
+    #   44817: 4 sliders (drawers only)
+    #   46230: 3 sliders (drawers only)
+    # SAM3 prompts must match what the task is actually grasping/moving — earlier
+    # mismatch ("lower drawer" prompt while panda grasps the door) gave empty
+    # masks ⇒ Phase C joint estimator never populated ⇒ emit_urdf raises
+    # "SceneState.joint is not populated".
     40147: dict(
-        parts=["lower drawer", "cabinet body", "upper drawer"],
-        moving=["lower drawer"],
-        static=["cabinet body", "upper drawer"],
+        parts=["cabinet door", "cabinet body", "drawer"],
+        moving=["cabinet door"],
+        static=["cabinet body", "drawer"],
     ),
     44817: dict(
         parts=["second drawer", "cabinet body", "first drawer", "third drawer", "fourth drawer"],

@@ -25,7 +25,11 @@ import sapien.render
 # Reconstruction sidecar (Option 2 — Sidecar). Sends RGB-D frames to a
 # separate FastAPI server; does NOT affect ActionPlanner decisions.
 RECON_URL = "http://localhost:8002"
-RECON_SEND_INTERVAL = 200   # sim steps between /ingest_frame calls; ~2-3 s
+RECON_SEND_INTERVAL = 100   # was 200, briefly tried 30. Sweet spot: small
+                            # enough that Pull_Arc (~1.5k sim steps) yields
+                            # ~10-15 ingested frames covering 0–90° pose
+                            # spread, large enough that SAM3 video re-run
+                            # (O(N²) per call) doesn't bottleneck the loop.
 
 # -----------------
 # 数学工具
