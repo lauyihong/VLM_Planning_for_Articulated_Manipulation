@@ -391,4 +391,4 @@ async def detect(
     return results
 
 if __name__ == "__main__":
-    uvicorn.run("det_pipeline:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("det_pipeline:app", host="0.0.0.0", port=8001, reload=False)

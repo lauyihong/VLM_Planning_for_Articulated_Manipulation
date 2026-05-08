@@ -16,8 +16,16 @@ try:
 except ImportError:
     cv2 = None
 
+import requests
+import tempfile
+
 import sapien
 import sapien.render
+
+# Reconstruction sidecar (Option 2 — Sidecar). Sends RGB-D frames to a
+# separate FastAPI server; does NOT affect ActionPlanner decisions.
+RECON_URL = "http://localhost:8002"
+RECON_SEND_INTERVAL = 200   # sim steps between /ingest_frame calls; ~2-3 s
 
 # -----------------
 # 数学工具
@@ -513,10 +521,17 @@ def main():
         time.sleep(0.01)
 
     print("🚀 异步控制已启动...")
-    
+
     # 时钟对齐
     start_wall_time = time.perf_counter()
     accumulated_sim_time = 0.0
+
+    # Reconstruction sidecar state
+    recon_initialized = False
+    recon_state_dir = None
+    recon_frame_idx = 0
+    last_recon_send_step = 0
+    sim_step_count = 0
 
     try:
         while True:
@@ -644,6 +659,54 @@ def main():
                 }
                 comm_thread.obs_queue.put(obs_msg)
 
+                # === Reconstruction sidecar (Option 2): init on first frame, ingest periodically ===
+                sim_step_count += 1
+                if not recon_initialized:
+                    recon_state_dir = tempfile.mkdtemp(prefix="recon_state_40147_")
+                    H, W = cur_rgb.shape[:2]
+                    fy = (H / 2.0) / math.tan(math.radians(fovy) / 2.0)
+                    fx = fy
+                    cx, cy = W / 2.0, H / 2.0
+                    try:
+                        resp = requests.post(f"{RECON_URL}/init", data=pickle.dumps({
+                            'partnet_id': 40147,
+                            'state_dir': recon_state_dir,
+                            'intrinsics': dict(fx=float(fx), fy=float(fy), cx=float(cx), cy=float(cy),
+                                               width=int(W), height=int(H)),
+                        }), timeout=120)
+                        j = resp.json()
+                        if j.get('ok'):
+                            print(f"[recon] initialized, state_dir={recon_state_dir}, parts={j.get('parts')}")
+                            recon_initialized = True
+                        else:
+                            print(f"[recon] init failed: {resp.text[:300]}")
+                    except Exception as e:
+                        print(f"[recon] init error (non-fatal): {e}")
+
+                if recon_initialized and sim_step_count - last_recon_send_step >= RECON_SEND_INTERVAL:
+                    # build c2w (4,4) from cam_pos / cam_mat (3,3)
+                    c2w = np.eye(4)
+                    c2w[:3, :3] = cam_mat
+                    c2w[:3,  3] = cam_pos
+                    try:
+                        resp = requests.post(f"{RECON_URL}/ingest_frame", data=pickle.dumps({
+                            'frame_idx': recon_frame_idx,
+                            'label':     f"f{recon_frame_idx:03d}",
+                            'rgb':       cur_rgb.astype(np.uint8),
+                            'depth_m':   cur_depth.astype(np.float32),
+                            'c2w':       c2w.astype(np.float64),
+                            'cam_pos_world': cam_pos.astype(np.float64),
+                        }), timeout=180)
+                        if resp.json().get('ok'):
+                            print(f"[recon] frame {recon_frame_idx} ingested")
+                            recon_frame_idx += 1
+                        else:
+                            print(f"[recon] ingest failed: {resp.text[:300]}")
+                    except Exception as e:
+                        print(f"[recon] ingest error (non-fatal): {e}")
+                    last_recon_send_step = sim_step_count
+                # === end reconstruction sidecar ===
+
             # --- 4. 渲染 ---
             if viewer is not None:
                 viewer.render()
@@ -652,6 +715,21 @@ def main():
 
     except KeyboardInterrupt: print("\n用户中断。")
     finally:
+        # === Reconstruction sidecar: emit URDF on shutdown ===
+        if recon_initialized:
+            out_dir = f"./recon_output/40147_{int(time.time())}"
+            try:
+                resp = requests.post(f"{RECON_URL}/emit_urdf", data=pickle.dumps({
+                    'out_dir': out_dir,
+                }), timeout=300)
+                j = resp.json()
+                if j.get('ok'):
+                    print(f"[recon] URDF emitted: {j['urdf']}")
+                else:
+                    print(f"[recon] emit failed: {j}")
+            except Exception as e:
+                print(f"[recon] emit error: {e}")
+        # === end ===
         comm_thread.running = False
         if recorder is not None:
             recorder['pose_file'].close()
