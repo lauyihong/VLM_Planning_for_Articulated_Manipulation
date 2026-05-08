@@ -70,7 +70,8 @@ DET_THRESHOLD    = 0.1
 USE_VISUALIZER   = True
 
 # USER_INSTRUCTION = "open the cabinet door"
-USER_INSTRUCTION = "open the second bottom drawer"
+# USER_INSTRUCTION = "open the second bottom drawer"
+USER_INSTRUCTION = "open the drawer"   # 40147 has exactly one drawer; less ambiguous than "second bottom drawer" which doesn't exist on this URDF
 
 # Motion tuning
 APPROACH_DIST   = 0.10   # m — standoff before grasping

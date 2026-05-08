@@ -74,9 +74,9 @@ PARTS_BY_ID = {
     # masks ⇒ Phase C joint estimator never populated ⇒ emit_urdf raises
     # "SceneState.joint is not populated".
     40147: dict(
-        parts=["cabinet door", "cabinet body", "drawer"],
-        moving=["cabinet door"],
-        static=["cabinet body", "drawer"],
+        parts=["drawer", "cabinet body", "cabinet door"],
+        moving=["drawer"],   # task 改成 "open the drawer"，sidecar 跟着追 drawer
+        static=["cabinet body", "cabinet door"],
     ),
     44817: dict(
         parts=["second drawer", "cabinet body", "first drawer", "third drawer", "fourth drawer"],
