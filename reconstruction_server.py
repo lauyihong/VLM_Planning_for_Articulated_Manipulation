@@ -103,16 +103,38 @@ def _preload_sam3_on_main_thread():
     via `asyncio.to_thread`) reliably segfaults with exit -11 on RTX 5090
     (sm_120). Initialising the CUDA primary context + model weights on the
     main thread up-front avoids that crash.
+
+    Also installs a `compute_masks_through_latest` shim that prefers
+    client-supplied ground-truth masks (from SAPIEN's segmentation buffer,
+    sent in /ingest_frame's `gt_masks` field) when available, falling back
+    to real SAM3 video tracking otherwise. The GT-mask path is for
+    debugging — use to confirm whether downstream Phase B/C/D/fuse failures
+    are caused by SAM3 mask quality.
     """
     global sam3
     if sam3 is None:
         print("[recon][startup] preloading SAM3 model on main thread...", flush=True)
         sam3 = StreamingSAM3()
         sam3.set_parts(["__warmup__"])         # arbitrary; replaced at /init
-        # _ensure_model() actually loads weights + .to(cuda).  We expose it
-        # via a tiny invocation rather than calling the private name directly.
         sam3._ensure_model()                    # noqa: SLF001
         print(f"[recon][startup] SAM3 ready (device={sam3._device})", flush=True)
+
+    # Install GT-mask shim. `_gt_masks` is a dict[frame_idx, dict[part_name, bool ndarray]].
+    # When all currently-buffered frames have a GT mask plant, the shim returns
+    # those directly without touching the GPU. When any frame lacks a plant
+    # (rare in our streaming use), it falls back to the original SAM3 method.
+    sam3._gt_masks = {}                          # type: ignore[attr-defined]
+    _real_compute = sam3.compute_masks_through_latest
+
+    def _compute_with_gt_fallback():
+        if not sam3.ready:
+            return None
+        if all(fidx in sam3._gt_masks for fidx in sam3.frames):
+            return {fidx: dict(sam3._gt_masks[fidx]) for fidx in sorted(sam3.frames)}
+        return _real_compute()
+
+    sam3.compute_masks_through_latest = _compute_with_gt_fallback   # type: ignore[method-assign]
+    print("[recon][startup] GT-mask shim installed on sam3.compute_masks_through_latest", flush=True)
 
 
 # ─────────────────────────── sync workers (run in thread pool) ────────────────
@@ -149,6 +171,19 @@ def _do_init(payload: dict) -> dict:
 def _do_ingest(payload: dict) -> dict:
     if state is None or sam3 is None:
         return {"ok": False, "error": "not initialized; POST /init first"}
+
+    # Plant ground-truth masks (if provided by client) into the sam3 shim's
+    # cache so `compute_masks_through_latest` skips real video tracking for
+    # this frame and returns the GT mask dict directly. See startup hook.
+    gt = payload.get('gt_masks')
+    if gt is not None and hasattr(sam3, '_gt_masks'):
+        # sam3 expects {part_name: bool ndarray (H,W)}; client already sends
+        # exactly that. Make a defensive copy so client array mutations
+        # post-POST don't race with downstream readers.
+        sam3._gt_masks[int(payload['frame_idx'])] = {
+            p: np.ascontiguousarray(m).astype(bool) for p, m in gt.items()
+        }
+
     try:
         status = ingest_frame(
             state,

@@ -403,6 +403,20 @@ def main():
     # 柜子分割 ID
     cabinet_seg_ids = set(l.entity.per_scene_id for l in cabinet.get_links())
 
+    # Per-link → SAM3-prompt mapping for sidecar GT-mask injection
+    # (PartNet 40147: link_0 = rotation_door, link_1 = slider drawer, link_2 = body)
+    LINK_TO_SAM3_PROMPT = {
+        'link_0': 'cabinet door',
+        'link_1': 'drawer',
+        'link_2': 'cabinet body',
+    }
+    cabinet_link_seg_map = {}
+    for link in cabinet.get_links():
+        prompt = LINK_TO_SAM3_PROMPT.get(link.name)
+        if prompt is not None:
+            cabinet_link_seg_map[prompt] = link.entity.per_scene_id
+    print(f"[client] cabinet GT-mask seg map: {cabinet_link_seg_map}")
+
     # 加载 Panda 机械臂
     panda_urdf = os.path.join(base_dir, "panda", "panda_v2.urdf")
     # if not os.path.exists(panda_urdf):
@@ -700,6 +714,17 @@ def main():
                     c2w = np.eye(4)
                     c2w[:3, :3] = cam_mat
                     c2w[:3,  3] = cam_pos
+
+                    # Ground-truth masks from SAPIEN segmentation buffer —
+                    # bypasses SAM3 mask tracking for sidecar Phase A. Used
+                    # to diagnose whether downstream phases work correctly
+                    # when fed perfect mask supervision.
+                    seg_id = seg_buf[:, :, 1].astype(np.int32)
+                    gt_masks = {
+                        prompt: (seg_id == sid)
+                        for prompt, sid in cabinet_link_seg_map.items()
+                    }
+
                     # Fire-and-forget HTTP POST in a daemon thread — sidecar's
                     # SAM3 video session is O(N²) per frame and serialised on
                     # its main thread; a synchronous post here would block the
@@ -715,6 +740,7 @@ def main():
                         'depth_m':       cur_depth.astype(np.float32).copy(),
                         'c2w':           c2w.astype(np.float64),
                         'cam_pos_world': cam_pos.astype(np.float64).copy(),
+                        'gt_masks':      {p: m.copy() for p, m in gt_masks.items()},
                     })
                     _frame_id = recon_frame_idx
                     def _async_ingest(payload, frame_id):
