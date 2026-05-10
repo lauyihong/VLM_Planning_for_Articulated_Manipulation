@@ -624,6 +624,12 @@ def main():
     current_stage = 'UNKNOWN'
     moving_link_synced = False  # latched True after first successful /set_moving_part
 
+    # One-shot diagnostic: dump SAPIEN seg_buf channel stats + pos_buf cam-Y
+    # sign on the first rendered frame so we can settle (a) which seg-channel
+    # carries per-link IDs and (b) the cam Y-up vs Y-down convention. See the
+    # block guarded by `not seg_diag_printed` further down.
+    seg_diag_printed = False
+
     try:
         while True:
             if viewer is not None and viewer.closed: break
@@ -716,6 +722,71 @@ def main():
                 cur_ap = get_agent_pos(hand_link, panda)
                 cur_rgb, cur_depth = get_raw_rgb_depth_from_buffers(pos_buf, col_buf)
                 cam_pos, cam_mat, fovy = get_camera_params(cam)
+
+                # ── One-shot diagnostic: settle seg-channel + cam Y convention ──
+                # Empirically, GT-mask shim was producing ~all-empty masks for
+                # cabinet_door / drawer (only cabinet_body got pixels). Dump
+                # every seg_buf channel's unique IDs vs. cabinet_link_seg_map
+                # to figure out which channel actually carries per-link IDs.
+                # Plus inspect pos_buf at top/center/bottom rows to verify the
+                # cam Y-up vs Y-down convention (relevant for Sub-milestone 1a's
+                # finger-tip projection).
+                if not seg_diag_printed:
+                    print("\n[DIAG] ────── seg_buf channel inspection ──────", flush=True)
+                    H_, W_ = seg_buf.shape[:2]
+                    print(f"[DIAG] seg_buf.shape={seg_buf.shape} dtype={seg_buf.dtype}")
+                    for ch in range(seg_buf.shape[2]):
+                        flat = seg_buf[..., ch].astype(np.int64).ravel()
+                        uniq, cnt = np.unique(flat, return_counts=True)
+                        order = np.argsort(-cnt)
+                        top = [(int(uniq[i]), int(cnt[i])) for i in order[:8]]
+                        print(f"[DIAG]   ch{ch}: {len(uniq)} unique IDs, "
+                              f"top 8 (id,count) = {top}")
+
+                    print(f"[DIAG] cabinet_seg_ids (set, from per_scene_id) = "
+                          f"{sorted(cabinet_seg_ids)}")
+                    print(f"[DIAG] cabinet_link_seg_map (prompt → per_scene_id) = "
+                          f"{cabinet_link_seg_map}")
+
+                    # Cross-reference each link's various potential ID attributes
+                    print("[DIAG] cabinet links — multiple ID candidates:")
+                    print(f"[DIAG]   {'name':<10} {'per_scene_id':>14} "
+                          f"{'entity.id':>12} {'global_id':>12}")
+                    for link in cabinet.get_links():
+                        ent = link.entity
+                        psid = getattr(ent, 'per_scene_id', '?')
+                        eid = getattr(ent, 'id', '?')
+                        gid = getattr(ent, 'global_id', '?')
+                        print(f"[DIAG]   {link.name:<10} {psid!r:>14} "
+                              f"{eid!r:>12} {gid!r:>12}")
+
+                    # Check whether each link's per_scene_id appears in any seg channel
+                    print("[DIAG] presence of cabinet_link_seg_map IDs in seg_buf channels:")
+                    for prompt, sid in cabinet_link_seg_map.items():
+                        hits = []
+                        for ch in range(seg_buf.shape[2]):
+                            n = int((seg_buf[..., ch] == sid).sum())
+                            hits.append(f"ch{ch}:{n}px")
+                        print(f"[DIAG]   {prompt!r:>20} (sid={sid}) → {' '.join(hits)}")
+
+                    # Cam convention: Y-up (OpenGL) vs Y-down (OpenCV) inferred
+                    # from camera-space Y at top/middle/bottom rows of pos_buf.
+                    # Sample center column to keep horizontal effect small.
+                    cx_, cy_ = W_ // 2, H_ // 2
+                    print("[DIAG] pos_buf cam-Y signs (center column):")
+                    for label_, vrow in [("top   v=0", 0),
+                                         ("center", cy_),
+                                         ("bottom v=H-1", H_ - 1)]:
+                        x_, y_, z_ = pos_buf[vrow, cx_, :3]
+                        print(f"[DIAG]   {label_:<14}: X={x_:+.3f}  Y={y_:+.3f}  "
+                              f"Z={z_:+.3f}  (Z<0 = front)")
+                    print("[DIAG] interpretation:")
+                    print("[DIAG]   if top_Y > bottom_Y → cam Y-UP (OpenGL); "
+                          "current v-flip fix is CORRECT")
+                    print("[DIAG]   if top_Y < bottom_Y → cam Y-DOWN (OpenCV); "
+                          "REVERT v-flip fix")
+                    print("[DIAG] ────────────────────────────────────────\n", flush=True)
+                    seg_diag_printed = True
 
                 # --- 录制：10Hz ---
                 if recorder is not None:
