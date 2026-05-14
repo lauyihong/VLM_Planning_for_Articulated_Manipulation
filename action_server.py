@@ -60,7 +60,7 @@ from loftr_fg import LoFTRAxisEstimatorFG
 
 # ─────────────────────────── Configuration ────────────────────────────────────
 
-ZMQ_PORT         = 5555
+ZMQ_PORT         = int(os.environ.get("VLM_ZMQ_PORT", "5555"))
 DET_SERVER_URL   = "http://127.0.0.1:8001/detect"
 DET_QUERIES      = ["handle"]
 
