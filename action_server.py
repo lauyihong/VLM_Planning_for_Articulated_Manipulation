@@ -100,10 +100,11 @@ MAX_DELTA_ANG   = np.deg2rad(2.5)
 GRIPPER_DELTA   = 0.003  # m per step
 GRIPPER_OPEN    = 0.04
 GRIPPER_CLOSED  = 0.000
-GRASP_OFFSET    = 0.08  # m — distance from Panda 'hand' frame to finger tips
-GRASP_DEPTH_OFFSET = 0.015  # m — pull back the target pose to avoid hitting the door
+GRASP_OFFSET    = 0.10  # m — distance from Panda 'hand' frame to finger tips
+
+RESET_RETREAT_DIST = 0.05  # m — move along current gripper -Z before returning home
 TARGET_Z_OFFSET = 0.00   # m — upward shift of the target grasp point
-NORMAL_SCAN_RADIUS = 0.15 # m — radius around handle to sample panel points
+NORMAL_SCAN_RADIUS = 0.1 # m — radius around handle to sample panel points
 
 PULL_LINEAR_DIST = 0.38  # m total drawer pull
 PULL_STEP        = 0.005  # m per step increment
@@ -112,6 +113,7 @@ ARC_STEP         = np.deg2rad(0.4)  # rad per step
 
 # ProbePull / TypeCheck
 PROBE_DISTANCE       = 0.05   # m — small pull for type identification
+PROBE_PULL_TIMEOUT   = 5.0    # s — stop ProbePull even if target distance is not reached
 TYPECHECK_MARGIN     = 0.002  # m — margin for Translation vs Rotation decision
 TYPECHECK_VISUALIZE_OPEN3D = False  # blocking Open3D window after TypeCheck
 EDGE_PERCENTILE      = 10     # % — edge band width for axis fitting
@@ -355,7 +357,7 @@ def project_world_to_pixel(point_world: np.ndarray,
 def backproject_mask_to_pcd(depth: np.ndarray, mask: np.ndarray,
                              cam_pos: np.ndarray, cam_mat: np.ndarray,
                              fovy_deg: float,
-                             max_points: int = 2000) -> np.ndarray:
+                             max_points: Optional[int] = 2000) -> np.ndarray:
     """Back-project all masked depth pixels to world-space point cloud (Nx3)."""
     h, w = depth.shape
     f = (h / 2.0) / np.tan(np.deg2rad(fovy_deg) / 2.0)
@@ -368,7 +370,7 @@ def backproject_mask_to_pcd(depth: np.ndarray, mask: np.ndarray,
     if len(v_idx) == 0:
         return np.zeros((0, 3), dtype=np.float64)
 
-    if len(v_idx) > max_points:
+    if max_points is not None and len(v_idx) > max_points:
         rng = np.random.default_rng(0)
         idxs = rng.choice(len(v_idx), max_points, replace=False)
         v_idx, u_idx, zs = v_idx[idxs], u_idx[idxs], zs[idxs]
@@ -994,10 +996,12 @@ def estimate_panel_normal(depth: np.ndarray, handle_bbox: List[int],
                            cam_pos: np.ndarray, cam_mat: np.ndarray,
                            fovy_deg: float,
                            parent_mask: Optional[np.ndarray] = None,
+                           robot_link_poses: Optional[Dict[str, np.ndarray]] = None,
                            scan_radius: float = NORMAL_SCAN_RADIUS) -> Tuple[np.ndarray, np.ndarray]:
     """
     Estimate the outward face normal of the panel around the handle.
-    Uses a 3D radius search + 2D handle bbox exclusion + SAM mask filtering.
+    Uses a 3D radius search + 2D handle bbox exclusion + optional SAM mask
+    and robot-link filtering.
     """
     h, w = depth.shape
     hx1, hy1, hx2, hy2 = [int(v) for v in handle_bbox]
@@ -1037,11 +1041,24 @@ def estimate_panel_normal(depth: np.ndarray, handle_bbox: List[int],
         if np.linalg.norm(p_world - handle_3d) < scan_radius:
             final_pts.append(p_world)
 
-    if len(final_pts) < 10:
-        print(f"[Planner] [ERROR] normal estimation failed: only {len(final_pts)} points. Using fallback.")
-        return -cam_mat[:, 2], np.array(final_pts) if final_pts else np.zeros((0, 3))
+    pts_world = (np.stack(final_pts)
+                 if final_pts else np.zeros((0, 3), dtype=np.float64))
 
-    pts_world = np.stack(final_pts)
+    robot_segments = get_robot_segments(robot_link_poses or {})
+    if len(pts_world) > 0 and robot_segments:
+        robot_mask = dist_to_robot_segments(pts_world, robot_segments)
+        removed = int(robot_mask.sum())
+        if removed > 0:
+            pts_world = pts_world[~robot_mask]
+            print(f"[Planner] Normal PCD robot filter: removed "
+                  f"{removed}/{removed + len(pts_world)} pts")
+
+    if len(pts_world) < 10:
+        print(f"[Planner] [ERROR] normal estimation failed: only "
+              f"{len(pts_world)} points after filtering "
+              f"(raw={len(final_pts)}). Using fallback.")
+        return -cam_mat[:, 2], pts_world
+
     ctr = pts_world.mean(axis=0)
     _, _, Vt = np.linalg.svd(pts_world - ctr)
     normal = Vt[-1]
@@ -1720,6 +1737,7 @@ class ActionPlanner:
         self.stages     : List[str]      = []
         self.stage_idx  : int            = 0
         self.stage_step_count : int      = 0
+        self.stage_started_at : Optional[float] = None
         self.detections : List[Dict]     = []
 
         self.handle_3d         : Optional[np.ndarray] = None
@@ -1727,6 +1745,9 @@ class ActionPlanner:
         self.grasp_pos         : Optional[np.ndarray] = None
         self.grasp_quat        : Optional[np.ndarray] = None
         self.post_pull_pos     : Optional[np.ndarray] = None
+        self.reset_retreat_pos : Optional[np.ndarray] = None
+        self.reset_retreat_quat: Optional[np.ndarray] = None
+        self.reset_retreat_grip: Optional[float] = None
         self.approach_pos      : Optional[np.ndarray] = None
         self.approach_quat     : Optional[np.ndarray] = None
         self.panel_normal      : Optional[np.ndarray] = None
@@ -1781,6 +1802,7 @@ class ActionPlanner:
         self.probe_end_link_poses     : Dict[str, np.ndarray]        = {}
         self.probe_end_gripper_pos    : Optional[np.ndarray]         = None
         self.probe_end_object_pcd     : Optional[np.ndarray]         = None
+        self.probe_pull_timeout_reported : bool = False
 
         # TypeCheck result
         self.typecheck_result : Optional[Dict] = None
@@ -1809,10 +1831,10 @@ class ActionPlanner:
                 "plan": ["Reset"],
                 "motion_type": "Reset",
             }
-            self.stages = ["Reset"]
+            self.stages = ["ResetRetreat", "Reset"]
             self.state = "EXECUTING"
             self.stage_idx = 0
-            print("[Planner] Reset-only instruction — returning to recorded home pose.")
+            print("[Planner] Reset-only instruction — retreating along gripper -Z, then returning home.")
             return
 
         # ── 1. Detection ───────────────────────────────────────────────────
@@ -1855,10 +1877,10 @@ class ActionPlanner:
         # whether ProbePull / TypeCheck are needed).
         vlm_plan = list(plan["plan"])
         if vlm_plan == ["Reset"]:
-            self.stages = ["Reset"]
+            self.stages = ["ResetRetreat", "Reset"]
             self.state = "EXECUTING"
             self.stage_idx = 0
-            print("[Planner] Reset-only plan — skipping handle geometry.")
+            print("[Planner] Reset-only plan — retreating along gripper -Z, then skipping handle geometry.")
             return
         has_pull = any("Pull" in s for s in vlm_plan)
         has_push = any("Push" in s for s in vlm_plan)
@@ -1879,13 +1901,42 @@ class ActionPlanner:
                   f"ID {handle_det['index']}; handle_3d = {np.round(self.handle_3d, 3)}")
         else:
             bx1, by1, bx2, by2 = handle_det["box"]
-            uc, vc = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
-            d_val = self._sample_valid_depth(depth, vc, uc, H, W)
+            handle_mask = None
+            if "mask" in handle_det:
+                handle_mask = decode_mask(handle_det["mask"], H, W)
 
-            if d_val > 0:
-                self.handle_3d = backproject_pixel(uc, vc, d_val, cam_pos, cam_mat, fovy, H, W)
+            if handle_mask is not None:
+                handle_pts = backproject_mask_to_pcd(
+                    depth, handle_mask, cam_pos, cam_mat, fovy, max_points=None
+                )
             else:
-                self.handle_3d = point_cloud.mean(axis=0)
+                handle_pts = np.zeros((0, 3), dtype=np.float64)
+
+            if len(handle_pts) > 0:
+                self.handle_3d = handle_pts.mean(axis=0)
+                print(f"[Planner] [Step 4/7] handle mask centroid from "
+                      f"{len(handle_pts)} points.")
+            else:
+                x1 = int(np.clip(np.floor(bx1), 0, W - 1))
+                y1 = int(np.clip(np.floor(by1), 0, H - 1))
+                x2 = int(np.clip(np.ceil(bx2), 0, W - 1))
+                y2 = int(np.clip(np.ceil(by2), 0, H - 1))
+                bbox_mask = np.zeros((H, W), dtype=bool)
+                if x2 >= x1 and y2 >= y1:
+                    bbox_mask[y1:y2 + 1, x1:x2 + 1] = True
+
+                bbox_pts = backproject_mask_to_pcd(
+                    depth, bbox_mask, cam_pos, cam_mat, fovy, max_points=None
+                )
+                if len(bbox_pts) > 0:
+                    self.handle_3d = bbox_pts.mean(axis=0)
+                    print("[Planner] [Step 4/7] WARNING: handle mask unavailable "
+                          f"or empty; used bbox point-cloud centroid from "
+                          f"{len(bbox_pts)} points.")
+                else:
+                    self.handle_3d = point_cloud.mean(axis=0)
+                    print("[Planner] [Step 4/7] WARNING: handle mask and "
+                          "bbox point cloud unavailable; used point cloud mean.")
 
             self.handle_3d[2] += TARGET_Z_OFFSET
             print(f"[Planner] [Step 4/7] handle_3d = {np.round(self.handle_3d, 3)}")
@@ -1920,7 +1971,8 @@ class ActionPlanner:
             self.panel_normal, self.normal_pts = estimate_panel_normal(
                 depth, handle_det["box"], self.handle_3d,
                 cam_pos, cam_mat, fovy,
-                parent_mask=None
+                parent_mask=None,
+                robot_link_poses=self._curr_link_poses,
             )
             print(f"[Planner] Final normal = {np.round(self.panel_normal, 3)}")
 
@@ -2095,6 +2147,8 @@ class ActionPlanner:
             return np.concatenate([curr_pos, matrix_to_rot6d(curr_rot), [curr_grip]]).astype(np.float32)
 
         stage = self.stages[self.stage_idx]
+        if self.stage_step_count == 0:
+            self.stage_started_at = time.monotonic()
         self.stage_step_count += 1
         tgt_pos, tgt_quat, tgt_grip = self._target(stage, curr_pos, curr_rot, curr_grip)
 
@@ -2122,6 +2176,20 @@ class ActionPlanner:
     def _target(self, stage: str, curr_pos, curr_rot,
                 curr_grip) -> Tuple[np.ndarray, np.ndarray, float]:
         """Return (target_pos, target_quat_wxyz, target_gripper_width)."""
+
+        # ── Reset pre-retreat ─────────────────────────────────────────────
+        if stage == "ResetRetreat":
+            if self.reset_retreat_pos is None:
+                retreat_dir = -curr_rot[:, 2]
+                self.reset_retreat_pos = curr_pos + retreat_dir * RESET_RETREAT_DIST
+                self.reset_retreat_quat = scipy_to_wxyz(R.from_matrix(curr_rot))
+                self.reset_retreat_grip = float(curr_grip)
+                print(f"[Planner] ResetRetreat target = "
+                      f"{np.round(self.reset_retreat_pos, 3)} "
+                      f"(current gripper -Z, {RESET_RETREAT_DIST:.2f}m)")
+            return (self.reset_retreat_pos,
+                    self.reset_retreat_quat,
+                    self.reset_retreat_grip)
 
         # ── Reset ─────────────────────────────────────────────────────────
         if stage == "Reset":
@@ -2399,6 +2467,9 @@ class ActionPlanner:
         if stage in ("MoveTo", "Approach", "Reset"):
             return (pos_err < APPROACH_POS_TOL) and (ang_err < STAGE_ANG_TOL)
 
+        elif stage == "ResetRetreat":
+            return pos_err < APPROACH_POS_TOL
+
         elif stage == "Grasp":
             return (grip_err < STAGE_GRIP_TOL) or (self.stage_step_count > GRASP_TIMEOUT_STEPS)
 
@@ -2406,6 +2477,14 @@ class ActionPlanner:
             if self.grasp_pos is None:
                 return False
             pulled = np.linalg.norm(curr_pos - self.grasp_pos)
+            elapsed = (time.monotonic() - self.stage_started_at
+                       if self.stage_started_at is not None else 0.0)
+            if elapsed >= PROBE_PULL_TIMEOUT:
+                if not self.probe_pull_timeout_reported:
+                    print(f"[Planner] ProbePull timeout after {elapsed:.1f}s "
+                          f"(pulled={pulled:.4f}m); treating probe as complete.")
+                    self.probe_pull_timeout_reported = True
+                return True
             return pulled >= PROBE_DISTANCE - 0.005
 
         elif stage == "TypeCheck":

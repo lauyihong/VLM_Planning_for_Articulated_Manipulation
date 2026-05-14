@@ -405,7 +405,7 @@ def main():
     #      panda_urdf = "/home/wby/active_vision/vlm_based/panda/panda_v2.urdf"
     
     panda = loader.load(panda_urdf)
-    panda.set_pose(sapien.Pose(p=[0.4, 0.25, 0.0]))
+    panda.set_pose(sapien.Pose(p=[0.4, 0.30, 0.0]))
 
     panda_links = panda.get_links()
     hand_link = next(l for l in panda_links if l.name == 'panda_hand')
@@ -428,7 +428,7 @@ def main():
     for j in gripper_joints:
         j.set_armature(np.ones(j.dof, dtype=np.float32) * 5.0) # 这是一个黑魔法，能让夹爪变得像石头一样硬
 
-    init_qpos = np.array([-1.7046, -0.1386, 1.0432, -0.5671, -0.1289, 2.8682, -1.3343, 0.04, 0.04])
+    init_qpos = np.array([-1.7046, -0.1386, 1.2432, -0.8671, -0.1289, 2.8682, -1.3343, 0.04, 0.04])
     panda.set_qpos(init_qpos)
     for i, ji in enumerate(arm_indices): arm_joints[i].set_drive_target(float(init_qpos[ji]))
     for i, ji in enumerate(gripper_indices): gripper_joints[i].set_drive_target(float(init_qpos[ji]))
@@ -452,41 +452,8 @@ def main():
         for comp in link.entity.get_components():
             if isinstance(comp, sapien.physx.PhysxCollisionShape): comp.set_material(ps_mat)
 
-    # ── 碰撞过滤：取消手臂与柜子的碰撞，保留手指与柜子/把手的碰撞 ──────────
-    # SAPIEN collision_groups = (g0, g1, g2, g3)
-    # 规则：A 忽略 B  ⟺  (A.g3 & B.g0) != 0  或  (B.g3 & A.g0) != 0
-    #
-    # 分配方案：
-    #   bit1 (0x2) → "柜子"标签
-    #   机械臂手臂（非手指）links → g3 |= bit1  （忽略带 bit1 的对象）
-    #   柜子所有 links            → g0 |= bit1  （被标记为柜子）
-    #   手指 links                → 不修改       （与柜子保持碰撞）
-
-    CABINET_BIT = 0x2   # 标记"柜子"的 bit
-
-    # 1. 给柜子所有 links 的碰撞形状打上 CABINET_BIT 标记（group0）
-    for link in cabinet.get_links():
-        for comp in link.entity.get_components():
-            if isinstance(comp, sapien.physx.PhysxCollisionShape):
-                g = list(comp.collision_groups)   # [g0, g1, g2, g3]
-                g[0] |= CABINET_BIT
-                comp.collision_groups = tuple(g)
-
-    # 2. 机械臂手臂 links（排除手指）→ group3 设 CABINET_BIT（忽略柜子）
-    finger_names = {'panda_leftfinger', 'panda_rightfinger'}
-    for link in panda_links:
-        if link.name in finger_names:
-            continue   # 手指保留与柜子的碰撞
-        for comp in link.entity.get_components():
-            if isinstance(comp, sapien.physx.PhysxCollisionShape):
-                g = list(comp.collision_groups)
-                g[3] |= CABINET_BIT   # 忽略 group0 带 CABINET_BIT 的对象（即柜子）
-                comp.collision_groups = tuple(g)
-
-    print("[Collision] 手臂↔柜子碰撞已禁用，手指↔柜子碰撞保留。")
-
     cam = scene.add_camera('rgbd_camera', 640, 480, np.deg2rad(60), 0.01, 10.0)
-    cam_eye, cam_target = np.array([-1.14, -0.09, 1.2]), np.array([1.367079, 0.197510, 0.82])
+    cam_eye, cam_target = np.array([-0.42, 1.48, 1.2]), np.array([1.367079, 0.197510, 0.82])
     cam.entity.set_pose(sapien_look_at(cam_eye, cam_target))
 
     # 录制器初始化
@@ -518,16 +485,6 @@ def main():
     obs_history = {'pc': [], 'gp': [], 'ap': []}
     step_idx = 0
     
-    # 预览模式
-    started = False
-    while not started:
-        if viewer is not None:
-            if viewer.closed: return
-            if viewer.window.key_down('space'): started = True
-            viewer.render()
-        scene.step()
-        time.sleep(0.01)
-
     print("🚀 异步控制已启动...")
     
     # 时钟对齐
