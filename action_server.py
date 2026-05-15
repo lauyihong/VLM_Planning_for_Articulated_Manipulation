@@ -42,6 +42,7 @@ import base64
 import json
 import os
 import pickle
+import sys
 import queue
 import threading
 import time
@@ -2847,12 +2848,18 @@ def main():
     print(f"[Server] Detection endpoint: {DET_SERVER_URL}")
     print(f"[Server] use_api={args.use_api}")
 
-    print("\n" + "=" * 60)
-    print("Welcome to Interactive VLM Action Server!")
-    print("=" * 60)
-    initial_instruction = input(f"[Server] Enter initial instruction (default: '{USER_INSTRUCTION}'): ").strip()
-    if not initial_instruction:
+    if sys.stdin.isatty():
+        print("\n" + "=" * 60)
+        print("Welcome to Interactive VLM Action Server!")
+        print("=" * 60)
+        initial_instruction = input(f"[Server] Enter initial instruction (default: '{USER_INSTRUCTION}'): ").strip()
+        if not initial_instruction:
+            initial_instruction = USER_INSTRUCTION
+    else:
+        # Non-interactive launch (e.g. run_all.sh backgrounds this with no
+        # stdin): skip the prompt, use the USER_INSTRUCTION env/default.
         initial_instruction = USER_INSTRUCTION
+        print("[Server] Non-interactive (no TTY) — using USER_INSTRUCTION.")
     print(f"[Server] Starting with instruction: '{initial_instruction}'\n" + "=" * 60)
 
     planner = ActionPlanner(user_instruction=initial_instruction, use_api=args.use_api)
@@ -2893,8 +2900,11 @@ def main():
             }
             socket.send(zlib.compress(pickle.dumps(reply, protocol=pickle.HIGHEST_PROTOCOL)))
 
-            # Interactive task loop
-            if planner.state in ("DONE", "ERROR"):
+            # Interactive task loop — only prompt for a follow-up instruction
+            # when stdin is a TTY. Under a non-interactive launch (run_all.sh)
+            # there is no next instruction: leave the planner in DONE and keep
+            # serving so the client can detect completion and shut down.
+            if planner.state in ("DONE", "ERROR") and sys.stdin.isatty():
                 print("\n" + "=" * 60)
                 print(f"[Server] Task execution finished. State: {planner.state}")
                 print("=" * 60)

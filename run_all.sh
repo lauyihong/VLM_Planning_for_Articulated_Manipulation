@@ -15,12 +15,12 @@
 set -u
 CABINET_ID="${1:-40147}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONDA_SH="/home/harvardair/Downloads/yes/etc/profile.d/conda.sh"
+CONDA_SH="${CONDA_SH:-${HOME}/miniforge3/etc/profile.d/conda.sh}"
 ENV_NAME="owlsam"
 DET_PORT=8001
 ZMQ_PORT=5555
 RECON_PORT=8002
-RECON_PATH="${RECONSTRUCTION_PIPELINE_PATH:-/home/harvardair/.yifeng/reconstruction_activeperception}"
+RECON_PATH="${RECONSTRUCTION_PIPELINE_PATH:-${HOME}/projects/reconstruction_activeperception}"
 LOG_DIR="${REPO_DIR}/logs"
 mkdir -p "${LOG_DIR}"
 DET_LOG="${LOG_DIR}/det_pipeline.log"
@@ -45,14 +45,19 @@ echo "✅ 已激活 conda env: ${ENV_NAME}  (python: $(python -V 2>&1))"
 # Source the OpenAI key file if present (for action_server VLM call_vlm + the
 # sidecar's Phase D update_joint_vlm). nohup'd / non-interactive shells skip
 # ~/.bashrc's source line, so we do it explicitly here.
-if [[ -f "${HOME}/.openai_env" ]]; then
-  # shellcheck disable=SC1091
-  source "${HOME}/.openai_env"
+# Try ~/.env (this Linux box) first, then ~/.openai_env (legacy Harvard convention).
+SECRETS_FILE=""
+if [[ -f "${HOME}/.env" ]]; then SECRETS_FILE="${HOME}/.env"
+elif [[ -f "${HOME}/.openai_env" ]]; then SECRETS_FILE="${HOME}/.openai_env"
+fi
+if [[ -n "${SECRETS_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${SECRETS_FILE}"
   if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-    echo "✅ OPENAI_API_KEY loaded (length=${#OPENAI_API_KEY}, prefix=${OPENAI_API_KEY:0:7}…)"
+    echo "✅ OPENAI_API_KEY loaded from ${SECRETS_FILE} (length=${#OPENAI_API_KEY}, prefix=${OPENAI_API_KEY:0:7}…)"
   fi
 else
-  echo "⚠️  ~/.openai_env not found — VLM (action_server.call_vlm) and Phase D"
+  echo "⚠️  no ~/.env or ~/.openai_env found — VLM (action_server.call_vlm) and Phase D"
   echo "   (sidecar.update_joint_vlm) will both fall back to defaults."
 fi
 
