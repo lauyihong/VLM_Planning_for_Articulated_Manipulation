@@ -41,6 +41,13 @@ RECON_MAX_INGEST = 15        # cap total ingests per task. Bumped from 8 → 15
                              # disable the shim and use real SAM3, drop back
                              # to ~10 because video session re-cost is O(N²).
 
+# F1c: depth-diff dynamic-mask area thresholds. RELAXED is passed into
+# get_dynamic_mask's internal CC filter (smaller than loftr_fg's default 3000
+# so arm-split half-doors survive). FINAL is the post-arm-subtract minimum;
+# below it we fall back to SAM3 for this frame. Tune in Commit 4 if needed.
+MIN_AREA_RELAXED = 600
+MIN_AREA_FINAL = 800
+
 ROBOT_LINK_NAMES = [
     "panda_link0", "panda_link1", "panda_link2", "panda_link3", "panda_link4",
     "panda_link5", "panda_link6", "panda_link7", "panda_link8",
@@ -602,6 +609,7 @@ def main():
     prev_stage = 'UNKNOWN'
     current_stage = 'UNKNOWN'
     moving_link_synced = False  # latched True after first successful /set_moving_part
+    inferred: str | None = None  # moving-link name set by infer_moving_link_from_grasp_pose
 
     # One-shot diagnostic: dump SAPIEN seg_buf channel stats + pos_buf cam-Y
     # sign on the first rendered frame so we can settle (a) which seg-channel
@@ -866,15 +874,29 @@ def main():
                     c2w[:3, :3] = cam_mat
                     c2w[:3,  3] = cam_pos
 
-                    # Ground-truth masks from SAPIEN segmentation buffer —
-                    # bypasses SAM3 mask tracking for sidecar Phase A. Used
-                    # to diagnose whether downstream phases work correctly
-                    # when fed perfect mask supervision.
+                    # F1c: dyn-mask carves the moving link from depth diff;
+                    # SAPIEN GT-per-link (∩ ~dyn) supplies static-link labels.
+                    # Falls back to SAM3 (gt_masks=None) when dyn is invalid
+                    # or grasp not yet synced. Under Commit 2 the sidecar shim
+                    # is still all-or-nothing per frame, so until Commit 3 lands
+                    # SAM3 effectively owns the whole window — that's expected.
                     seg_id = seg_buf[:, :, 1].astype(np.int32)
-                    gt_masks = {
-                        prompt: (seg_id == sid)
-                        for prompt, sid in cabinet_link_seg_map.items()
-                    }
+                    gt_masks = None
+                    if (prev_depth_for_dyn is not None
+                            and moving_link_synced
+                            and inferred is not None):
+                        arm_mask = np.isin(seg_id, list(robot_seg_ids))
+                        dyn = get_dynamic_mask(
+                            prev_depth_for_dyn, cur_depth,
+                            min_area=MIN_AREA_RELAXED,
+                        )
+                        dyn &= ~arm_mask
+                        if int(dyn.sum()) >= MIN_AREA_FINAL:
+                            gt_masks = {inferred: dyn}
+                            for prompt, sid in cabinet_link_seg_map.items():
+                                if prompt == inferred:
+                                    continue
+                                gt_masks[prompt] = (seg_id == sid) & ~dyn
 
                     # Fire-and-forget HTTP POST in a daemon thread — sidecar's
                     # SAM3 video session is O(N²) per frame and serialised on
@@ -891,7 +913,7 @@ def main():
                         'depth_m':       cur_depth.astype(np.float32).copy(),
                         'c2w':           c2w.astype(np.float64),
                         'cam_pos_world': cam_pos.astype(np.float64).copy(),
-                        'gt_masks':      {p: m.copy() for p, m in gt_masks.items()},
+                        'gt_masks':      None if gt_masks is None else {p: m.copy() for p, m in gt_masks.items()},
                     })
                     _frame_id = recon_frame_idx
                     def _async_ingest(payload, frame_id):
@@ -910,6 +932,10 @@ def main():
                                      daemon=True).start()
                     recon_frame_idx += 1
                     last_recon_send_wall_time = current_wall_time
+                    # F1c: log this frame's depth so the next recon frame can
+                    # depth-diff against it. Must be inside the ingest gate
+                    # (carries across recon frames, NOT sim frames).
+                    prev_depth_for_dyn = cur_depth.copy()
                 # === end reconstruction sidecar ===
 
             # --- 4. 渲染 ---
